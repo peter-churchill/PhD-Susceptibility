@@ -620,4 +620,99 @@ def OLSGraph(x, y, summary=True, title='OLS Regression: Nd vs CCN'):
 
 
 
+# ============================================================================
+# Susceptibility builders (lifted from notebooks; canonical two-return versions)
+# ============================================================================
 
+def susceptibility_by_level(CCN_ds, CDNC_da):
+    """
+    Per-level susceptibility: OLS/TLS/Deming/PCA slope & intercept between
+    CCN(radius, lev, time) and CDNC(lev, time), reduced over 'time', in
+    log10-log10 space. The TLS fit is stored under the 'ODR' key here (the
+    all-level builder stores the same method as 'TLS').
+
+    Returns (ds_out, ds_out2): slopes/intercepts, and the aligned CCN/CDNC.
+    """
+    CCN_aligned, CDNC_aligned = xr.align(CCN_ds, CDNC_da)
+
+    def _fit(func):
+        return xr.apply_ufunc(
+            func,
+            np.log10(CCN_aligned),
+            np.log10(CDNC_aligned),
+            input_core_dims=[['time'], ['time']],
+            output_core_dims=[[], []],
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=[float, float],
+        )
+
+    OLS_slope, OLS_intercept       = _fit(OLS_fit)
+    ODR_slope, ODR_intercept       = _fit(TLS_fit)
+    Deming_slope, Deming_intercept = _fit(deming_fit)
+    PCA_slope, PCA_intercept       = _fit(PCA_fit)
+
+    ds_out = xr.Dataset(
+        data_vars={
+            'OLS slope': (('radius', 'lev'), OLS_slope.data),
+            'OLS intercept': (('radius', 'lev'), OLS_intercept.data),
+            'ODR slope': (('radius', 'lev'), ODR_slope.data),
+            'ODR intercept': (('radius', 'lev'), ODR_intercept.data),
+            'Deming slope': (('radius', 'lev'), Deming_slope.data),
+            'Deming intercept': (('radius', 'lev'), Deming_intercept.data),
+            'PCA slope': (('radius', 'lev'), PCA_slope.data),
+            'PCA intercept': (('radius', 'lev'), PCA_intercept.data),
+        },
+        coords={'radius': CCN_aligned.radius, 'lev': CCN_aligned.lev},
+    )
+    ds_out2 = xr.Dataset(
+        data_vars={'CCN': CCN_aligned, 'CDNC': CDNC_aligned},
+        coords={
+            'radius': CCN_aligned.radius,
+            'lev': CCN_aligned.lev,
+            'time': CCN_aligned.time,
+        },
+    )
+    return ds_out, ds_out2
+
+
+def compute_allLev(CCN_ds, CDNC_da):
+    """
+    All-level pooled susceptibility: one OLS/TLS/Deming/PCA slope & intercept
+    per radius, flattening over 'lev' and 'time'. CDNC broadcast to CCN's shape.
+    Returns ds_out with 'All_Level_<METHOD>_slope'/'_intercept' per radius.
+    """
+    CCN_aligned, CDNC_aligned = xr.align(CCN_ds, CDNC_da)
+    CDNC_broadcast = CDNC_aligned.broadcast_like(CCN_aligned)
+
+    def _fit(func):
+        return xr.apply_ufunc(
+            func,
+            np.log10(CCN_aligned),
+            np.log10(CDNC_broadcast),
+            input_core_dims=[['lev', 'time'], ['lev', 'time']],
+            output_core_dims=[[], []],
+            vectorize=True,
+            dask='parallelized',
+            output_dtypes=[float, float],
+        )
+
+    slope_OLS, intercept_OLS       = _fit(OLS_fit)
+    slope_TLS, intercept_TLS       = _fit(TLS_fit)
+    slope_Deming, intercept_Deming = _fit(deming_fit)
+    slope_PCA, intercept_PCA       = _fit(PCA_fit)
+
+    ds_out = xr.Dataset(
+        data_vars={
+            'All_Level_OLS_slope': (('radius',), slope_OLS.data),
+            'All_Level_OLS_intercept': (('radius',), intercept_OLS.data),
+            'All_Level_TLS_slope': (('radius',), slope_TLS.data),
+            'All_Level_TLS_intercept': (('radius',), intercept_TLS.data),
+            'All_Level_Deming_slope': (('radius',), slope_Deming.data),
+            'All_Level_Deming_intercept': (('radius',), intercept_Deming.data),
+            'All_Level_PCA_slope': (('radius',), slope_PCA.data),
+            'All_Level_PCA_intercept': (('radius',), intercept_PCA.data),
+        },
+        coords={'radius': CCN_aligned.radius},
+    )
+    return ds_out
