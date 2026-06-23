@@ -747,3 +747,136 @@ def compute_allLev(CCN_ds, CDNC_da):
         coords={'radius': CCN_aligned.radius},
     )
     return ds_out
+
+
+# ============================================================================
+# TLS diagnostics (lifted from TotalLeastSquares.ipynb / Susceptibility_Intro.ipynb)
+# ----------------------------------------------------------------------------
+# Bootstrap confidence intervals on the TLS slope, and an assumption-test that
+# recommends TLS vs ODR. Both operate on (x, y) data; TLS_fit is defined above.
+# Requires: numpy (np), matplotlib.pyplot (plt), statsmodels.api (sm).
+# ============================================================================
+
+def TLS_bootstrap(x, y, n_bootstrap=1000, random_state=None, plot=True):
+    """
+    Total Least Squares slope on log10-log10 data, with bootstrapped 95% CIs.
+
+    Parameters
+    ----------
+    x, y : array-like or xarray.DataArray
+        Input data (e.g. CCN and Nd).
+    n_bootstrap : int
+        Number of bootstrap resamples.
+    random_state : int or None
+        Seed for reproducibility.
+    plot : bool
+        If True, return a hexbin plot with the fit line.
+
+    Returns
+    -------
+    results : dict
+        slope, intercept, R, slope_CI, intercept_CI.
+    (fig, ax) : matplotlib Figure/Axes or (None, None) if plot=False.
+    """
+    x = np.asarray(x).ravel()
+    y = np.asarray(y).ravel()
+    mask = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
+    x, y = x[mask], y[mask]
+
+    X = np.log10(x)
+    Y = np.log10(y)
+    n = len(X)
+    rng = np.random.default_rng(random_state)
+
+    slope, intercept = TLS_fit(X, Y)
+    R = np.corrcoef(X, Y)[0, 1]
+
+    slopes = np.empty(n_bootstrap)
+    intercepts = np.empty(n_bootstrap)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, n)
+        slopes[i], intercepts[i] = TLS_fit(X[idx], Y[idx])
+
+    slope_CI = np.percentile(slopes, [2.5, 97.5])
+    intercept_CI = np.percentile(intercepts, [2.5, 97.5])
+
+    print(f"TLS slope = {slope:.3f} (95% CI {slope_CI[0]:.3f}, {slope_CI[1]:.3f})")
+    print(f"Intercept = {intercept:.3f} (95% CI {intercept_CI[0]:.3f}, {intercept_CI[1]:.3f})")
+    print(f"Correlation R = {R:.3f}")
+
+    results = {"slope": slope, "intercept": intercept, "R": R,
+               "slope_CI": slope_CI, "intercept_CI": intercept_CI}
+
+    fig, ax = None, None
+    if plot:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        hb = ax.hexbin(x, y, gridsize=50, bins='log',
+                       xscale='log', yscale='log', cmap='inferno', mincnt=1)
+        lims = [1, 1e4]
+        ax.set_xlim(lims); ax.set_ylim(lims)
+        x_fit = np.array(lims)
+        y_fit = 10 ** (intercept + slope * np.log10(x_fit))
+        ax.plot(x_fit, y_fit, 'r-', lw=2,
+                label=f"TLS slope={slope:.2f} [95% CI {slope_CI[0]:.2f}, {slope_CI[1]:.2f}]")
+        ax.plot(lims, lims, 'k--', lw=1, label='1:1 line')
+        ax.set_xscale('log'); ax.set_yscale('log')
+        ax.set_xlabel('CCN [cm$^{-3}$]'); ax.set_ylabel('Nd [cm$^{-3}$]')
+        ax.legend(); ax.set_aspect('equal', adjustable='box')
+        plt.colorbar(hb, ax=ax, label='Counts')
+
+    return results, (fig, ax)
+
+
+def test_tls_assumptions(X_log, Y_log, plot=True, var_ratio_threshold=2, ortho_std_threshold=0.2):
+    """
+    Test whether TLS is appropriate vs ODR, from log-log (X, Y) data.
+
+    Checks the residual variance ratio and orthogonal-residual spread, and returns
+    a recommendation. Returns (summary dict, x-residuals, y-residuals).
+    """
+    X_design = sm.add_constant(X_log)
+    ols_model = sm.OLS(Y_log, X_design).fit()
+    slope, intercept = ols_model.params[1], ols_model.params[0]
+
+    y_pred = intercept + slope * X_log
+    res_y = Y_log - y_pred
+    res_x = X_log - X_log.mean()
+
+    orthogonal_dist = np.abs(slope * (X_log - X_log.mean()) - (Y_log - Y_log.mean())) / np.sqrt(1 + slope**2)
+
+    var_x = np.var(res_x, ddof=1)
+    var_y = np.var(res_y, ddof=1)
+    var_ratio = var_x / var_y if var_x > var_y else var_y / var_x
+
+    if var_ratio <= var_ratio_threshold and np.std(orthogonal_dist) <= ortho_std_threshold:
+        tls_recommendation = "TLS/SVD reasonable"
+    else:
+        tls_recommendation = "Use ODR with explicit errors"
+
+    summary = {
+        "OLS slope": slope, "OLS intercept": intercept,
+        "Var(x residuals)": var_x, "Var(y residuals)": var_y,
+        "Variance ratio": var_ratio,
+        "Orthogonal residuals mean": np.mean(orthogonal_dist),
+        "Orthogonal residuals std": np.std(orthogonal_dist),
+        "TLS recommendation": tls_recommendation,
+    }
+
+    if plot:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        axes[0].scatter(X_log, res_y); axes[0].axhline(0, color='r', ls='--')
+        axes[0].set_title("Vertical Residuals"); axes[0].set_xlabel("CCN (log)"); axes[0].set_ylabel("Nd Residuals")
+        axes[1].scatter(Y_log, res_x); axes[1].axhline(0, color='r', ls='--')
+        axes[1].set_title("Horizontal Residuals"); axes[1].set_xlabel("Nd (log)"); axes[1].set_ylabel("CCN Residuals")
+        axes[2].scatter(X_log, orthogonal_dist); axes[2].axhline(np.mean(orthogonal_dist), color='r', ls='--')
+        axes[2].set_title("Orthogonal Distances"); axes[2].set_xlabel("CCN (log)"); axes[2].set_ylabel("Distance")
+        plt.tight_layout(); plt.show()
+
+    print("\n--- TLS Assumption Test ---")
+    print(f"OLS slope: {slope:.4f}, intercept: {intercept:.4f}")
+    print(f"Var(x residuals): {var_x:.4f}, Var(y residuals): {var_y:.4f}")
+    print(f"Variance ratio: {var_ratio:.4f}")
+    print(f"Orthogonal residuals mean +/- std: {np.mean(orthogonal_dist):.4f} +/- {np.std(orthogonal_dist):.4f}")
+    print(f"TLS recommendation: {tls_recommendation}")
+
+    return summary, res_x, res_y
