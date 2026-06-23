@@ -88,7 +88,7 @@ def NorESMExtract_Dask(NorPath, station, VarList, Xspace, PNSD=True, chunks="aut
         return ds
 
 
-def ECearthExtract_Dask(ECPath, station, ifsVarList, ifsVarNames, Xspace, PNSD=True, chunks="auto"):
+def ECearthExtract_Dask(ECPath, station, ifsVarList, ifsVarNames, Xspace, PNSD=True, chunks="auto", cdnc_cloud_threshold=8640.0):
     """
     Lazily load EC-Earth data for one station, returning aerosol modes, CDNC, and
     any requested IFS variables — all on EC-Earth's 34 model levels.
@@ -181,7 +181,11 @@ def ECearthExtract_Dask(ECPath, station, ifsVarList, ifsVarNames, Xspace, PNSD=T
 
     # --- CDNC = var20/var22 (where var22>0), regridded onto the 34 levels -----
     if "var20" in Data and "var22" in Data:
-        cdnc_ifs = (Data["var20"] / Data["var22"]).where(Data["var22"] > 0)
+        # var22 = liquid-cloud-time (max 10800 s = 3h interval); 8640 = 80% cloud
+        # cover, matching the NorESM FREQL>0.8 mask. Mask the DENOMINATOR before
+        # dividing so no divide-by-near-zero occurs (avoids the inf/nan warnings).
+        var22_masked = Data["var22"].where(Data["var22"] >= cdnc_cloud_threshold)
+        cdnc_ifs = Data["var20"] / var22_masked
         ds["CDNC"] = _ifs_to_eclev(cdnc_ifs)
 
     # --- Attach physical pressure as a coordinate on lev (for labelling) ------
