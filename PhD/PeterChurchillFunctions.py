@@ -47,7 +47,7 @@ def NorESMExtract_Dask(NorPath, station, VarList, Xspace, PNSD=True, chunks="aut
         if var in Data:
             ds[var] = Data[var]
         else:
-            print(f"Variable {var} not found in dataset.")
+            print(f"⚠️ Variable {var} not found in dataset.")
             
     #Create a CDNC variable
     ds['CDNC'] = Data['AWNC']/Data['FREQL']
@@ -69,7 +69,6 @@ def NorESMExtract_Dask(NorPath, station, VarList, Xspace, PNSD=True, chunks="aut
                 Data[nmr],
                 Data[sig],
                 dask="parallelized",
-                dask_gufunc_kwargs={'allow_rechunk': True},
                 output_dtypes=[float],
             )
 
@@ -91,125 +90,132 @@ def NorESMExtract_Dask(NorPath, station, VarList, Xspace, PNSD=True, chunks="aut
 
 def ECearthExtract_Dask(ECPath, station, ifsVarList, ifsVarNames, Xspace, PNSD=True, chunks="auto"):
     """
-    Lazily load EC-Earth data using Dask and optionally compute PNSD.
+    Lazily load EC-Earth data for one station, returning aerosol modes, CDNC, and
+    any requested IFS variables — all on EC-Earth's 34 model levels.
+
+    EC-Earth IFS variables are stored as (time, lev_ifs, lev) where the 'lev' axis
+    is a spurious replication (the real vertical axis is the 91-level 'lev_ifs').
+    This function collapses that replicated axis, builds the physical IFS pressure
+    profile from var54, and per-station interpolates every requested IFS variable
+    (and CDNC) from the 91 IFS pressure levels onto EC-Earth's 34 model-level
+    pressures (from 'pressure', time-mean, converted Pa -> hPa).
 
     Parameters
     ----------
     ECPath : str
         Path to EC-Earth NetCDF file.
     station : str
-        Station name or coordinate.
+        Station name.
     ifsVarList : list of str
-        Raw variable names from IFS data.
+        Raw IFS variable names to extract and regrid onto the 34 levels (e.g.
+        ['var20', 'var22', 'var130']). May be empty.
     ifsVarNames : list of str
-        Desired standardized variable names.
+        Standardized output names, paired 1:1 with ifsVarList.
     Xspace : array-like
-        Size distribution bins.
+        Size-distribution diameter grid (for PNSD).
     PNSD : bool, optional
-        If True, compute dNdlogD distributions.
+        If True, also compute and return dNdlogD distributions.
     chunks : str or dict, optional
-        Dask chunking specification. Default 'auto'.
+        Dask chunking. Default 'auto'.
+
+    Returns
+    -------
+    ds : xr.Dataset
+        Aerosol modes (RDRY_*/RWET_*, N_*), CDNC, and the requested IFS variables,
+        all on dim 'lev' (the 34 native model levels). The physical pressure of
+        each level (hPa) is attached as the coordinate 'pressure_hPa'.
+    PNSD_ds : xr.Dataset, optional
+        Returned only if PNSD=True.
     """
-
     import xarray as xr
+    import numpy as np
 
-    #Open lazily with Dask
-    Data = xr.open_dataset(ECPath, chunks=chunks)
-    Data = Data.sel(station=station)
+    Data = xr.open_dataset(ECPath, chunks=chunks).sel(station=station)
 
     ds = xr.Dataset()
     PNSD_ds = xr.Dataset()
 
-    #Define variables (should be defined BEFORE usage)
     radius_variables = ['RDRY_NUS', 'RDRY_AIS', 'RDRY_ACS', 'RWET_AII', 'RDRY_COS', 'RWET_ACI', 'RWET_COI']
-    Numb_variables = ['N_NUS', 'N_AIS', 'N_ACS', 'N_AII', 'N_COS', 'N_ACI', 'N_COI']
-    ModesSigma = [1.59, 1.59, 1.59, 2.0, 1.59, 1.59, 2.0]
+    Numb_variables   = ['N_NUS', 'N_AIS', 'N_ACS', 'N_AII', 'N_COS', 'N_ACI', 'N_COI']
+    ModesSigma       = [1.59, 1.59, 1.59, 2.0, 1.59, 1.59, 2.0]
 
-    #Clean up radius variables (convert to nm if needed)
+    # --- Radius variables -> nm, drop non-positive ---
     for r in radius_variables:
         if r in Data:
             Data[r] = Data[r].where(Data[r] > 0)
-            if "units" in Data[r].attrs and Data[r].attrs["units"] == "m":
+            if Data[r].attrs.get("units") == "m":
                 Data[r] = Data[r] * 1e9
                 Data[r].attrs["units"] = "nm"
 
-    #Handle IFS variables (lazy reindexing)
-    if len(ifsVarList) > 0:
-        # Compute mean level variable
-        ds["lev_ifs"] = Data["var54"].mean("time")
+    # --- Vertical grids -------------------------------------------------------
+    # Target: EC-Earth's 34 model-level pressures (hPa), time-mean.
+    # NOTE: Data['lev'] is an INTEGER index (1..34), NOT pressure. The physical
+    # pressure lives in the 'pressure' variable.
+    ec_p = (Data["pressure"].mean("time")).compute()        # (lev,), Pa
+    if float(ec_p.max()) > 2000:                             # Pa -> hPa
+        ec_p = ec_p / 100
+    p_tgt = ec_p.values                                      # 34 target pressures (hPa)
 
-        for ifs, name in zip(ifsVarList, ifsVarNames):
-            if ifs not in Data:
-                print(f"IFS variable {ifs} not found in dataset.")
-                continue
-            ds[name] = Data[ifs].isel(lev=0).drop_vars("lev", errors="ignore")
-            # Note: align 'lev_ifs' and 'lev' lazily
-            if "lev" in Data:
-                ds[name] = ds[name].interp(lev_ifs=Data["lev"], method="nearest")
+    # Source: IFS pressure on the 91 lev_ifs levels (hPa), time-mean.
+    # var54 is constant along the spurious 'lev' axis -> isel(lev=0) collapses it.
+    ifs_p = (Data["var54"].isel(lev=0, drop=True).mean("time") / 100).compute()  # (lev_ifs,)
+    p_src = ifs_p.values
 
-        ds = ds.drop_vars("lev_ifs", errors="ignore")
+    def _ifs_to_eclev(da):
+        """Collapse replicated 'lev', then interp lev_ifs(pressure) -> 34 model levels."""
+        if "lev" in da.dims:
+            da = da.isel(lev=0, drop=True)                  # drop replicated axis
+        da = da.assign_coords(lev_ifs=p_src)                # physical pressure on lev_ifs
+        da = da.interp(lev_ifs=p_tgt)                       # onto the 34 EC pressures
+        # relabel onto the native integer lev so it aligns with the modes
+        da = (da.assign_coords(lev_ifs=("lev_ifs", Data["lev"].values))
+                .swap_dims({"lev_ifs": "lev"}))
+        return da
 
-    #Pressure to hPa
-    if "pressure" in Data:
-        ds["lev"] = Data["pressure"].mean("time") / 100
-        ds["lev"].attrs["units"] = "hPa"
-        
-    #  CDNC 
+    # --- Requested IFS variables, regridded onto the 34 levels ---------------
+    for ifs, name in zip(ifsVarList, ifsVarNames):
+        if ifs not in Data:
+            print(f"IFS variable {ifs} not found in dataset.")
+            continue
+        ds[name] = _ifs_to_eclev(Data[ifs])
+
+    # --- CDNC = var20/var22 (where var22>0), regridded onto the 34 levels -----
     if "var20" in Data and "var22" in Data:
-        cdnc = (Data["var20"] / Data["var22"]).where(Data["var22"] > 0)
-    
-        # If lev_ifs is present but lev is available, interpolate CDNC to lev
-        if "lev_ifs" in cdnc.dims and "lev" in Data:
-            cdnc = cdnc.interp(lev_ifs=Data["lev"])
-            cdnc = cdnc.rename({"lev_ifs": "lev"})
-    
-        #Assign and preserve Dask-lazy behavior
-        ds["CDNC"] = cdnc
-        
-    #Particle Number Size Distribution
+        cdnc_ifs = (Data["var20"] / Data["var22"]).where(Data["var22"] > 0)
+        ds["CDNC"] = _ifs_to_eclev(cdnc_ifs)
+
+    # --- Attach physical pressure as a coordinate on lev (for labelling) ------
+    ds = ds.assign_coords(pressure_hPa=("lev", p_tgt))
+
+    # --- Aerosol modes (already on the 34 native levels; no regrid needed) -----
+    for radius, conc in zip(radius_variables, Numb_variables):
+        if radius in Data:
+            ds[radius] = Data[radius]
+        if conc in Data:
+            ds[conc] = Data[conc]
+
+    # --- Optional PNSD --------------------------------------------------------
     if PNSD:
-        # Collect PNSD variables
         for radius, conc in zip(radius_variables, Numb_variables):
             if radius in Data and conc in Data:
                 PNSD_ds[radius] = Data[radius]
                 PNSD_ds[conc] = Data[conc]
 
-        # Compute distributions lazily with Dask
         dis_variable = ["NUS_dis", "AIS_dis", "ACS_dis", "COS_dis", "AII_dis", "ACI_dis", "COI_dis"]
-
         for radius, conc, sigma, dist in zip(radius_variables, Numb_variables, ModesSigma, dis_variable):
             if radius not in PNSD_ds or conc not in PNSD_ds:
                 continue
-
             PNSD_ds[dist] = xr.apply_ufunc(
                 dNdlogD,
-                PNSD_ds[conc],
-                Xspace,
-                PNSD_ds[radius] * 2,
-                sigma,
-                dask="parallelized",
-                dask_gufunc_kwargs={'allow_rechunk': True},
-                output_dtypes=[float],
+                PNSD_ds[conc], Xspace, PNSD_ds[radius] * 2, sigma,
+                dask="parallelized", output_dtypes=[float],
             )
-
-        # Combine all dNdlogD modes lazily
         dNdlogD_vars = [v for v in PNSD_ds.data_vars if v.endswith("_dis")]
-        if len(dNdlogD_vars) > 0:
+        if dNdlogD_vars:
             PNSD_ds["dNdlogD"] = sum(PNSD_ds[v] for v in dNdlogD_vars)
-
         return ds, PNSD_ds
 
-    else:
-        # Return only basic variables
-        for radius, conc in zip(radius_variables, Numb_variables):
-            if radius in Data:
-                ds[radius] = Data[radius]
-            if conc in Data:
-                ds[conc] = Data[conc]
-
-
-
-        return ds
+    return ds
 
 
 def NorComposition(NorPath, station):
@@ -298,7 +304,6 @@ def erf_function(r, R, sigma):
         erf,
         np.log(r / R) / (np.sqrt(2) * np.log(sigma)),
         dask="parallelized",
-        dask_gufunc_kwargs={'allow_rechunk': True},
         output_dtypes=[float]
     )
 
@@ -619,19 +624,35 @@ def OLSGraph(x, y, summary=True, title='OLS Regression: Nd vs CCN'):
     return model, (fig, ax)
 
 
-
 # ============================================================================
-# Susceptibility builders (lifted from notebooks; canonical two-return versions)
+# Susceptibility builders
+# ----------------------------------------------------------------------------
+# Lifted from notebooks (NorESM/EC-Earth susceptibility builders, intro) where
+# they were previously copy-pasted inline. Canonical two-return versions:
+# both return the slope/intercept Dataset AND the aligned CCN/CDNC used.
+# Estimators (OLS_fit / TLS_fit / deming_fit / PCA_fit) are defined above.
 # ============================================================================
 
 def susceptibility_by_level(CCN_ds, CDNC_da):
     """
     Per-level susceptibility: OLS/TLS/Deming/PCA slope & intercept between
-    CCN(radius, lev, time) and CDNC(lev, time), reduced over 'time', in
-    log10-log10 space. The TLS fit is stored under the 'ODR' key here (the
-    all-level builder stores the same method as 'TLS').
+    CCN(radius, lev, time) and CDNC(lev, time), reduced over 'time'.
 
-    Returns (ds_out, ds_out2): slopes/intercepts, and the aligned CCN/CDNC.
+    Fits are done in log10-log10 space, so each slope is the susceptibility
+    (a power-law exponent d ln CDNC / d ln CCN).
+
+    NOTE on naming: the total-least-squares fit is stored under the key 'ODR'
+    here (e.g. 'ODR slope'); the all-level builder stores the same method as
+    'TLS'. Same underlying method (Function.TLS_fit), two historical labels.
+
+    Returns
+    -------
+    ds_out : xr.Dataset
+        Variables '<FIT> slope' / '<FIT> intercept' with FIT in
+        {OLS, ODR, Deming, PCA}, dims (radius, lev).
+    ds_out2 : xr.Dataset
+        The aligned 'CCN' (radius, lev, time) and 'CDNC' (lev, time) used,
+        for downstream plotting.
     """
     CCN_aligned, CDNC_aligned = xr.align(CCN_ds, CDNC_da)
 
@@ -648,7 +669,7 @@ def susceptibility_by_level(CCN_ds, CDNC_da):
         )
 
     OLS_slope, OLS_intercept       = _fit(OLS_fit)
-    ODR_slope, ODR_intercept       = _fit(TLS_fit)
+    ODR_slope, ODR_intercept       = _fit(TLS_fit)      # 'ODR' label == TLS method
     Deming_slope, Deming_intercept = _fit(deming_fit)
     PCA_slope, PCA_intercept       = _fit(PCA_fit)
 
@@ -679,8 +700,14 @@ def susceptibility_by_level(CCN_ds, CDNC_da):
 def compute_allLev(CCN_ds, CDNC_da):
     """
     All-level pooled susceptibility: one OLS/TLS/Deming/PCA slope & intercept
-    per radius, flattening over 'lev' and 'time'. CDNC broadcast to CCN's shape.
-    Returns ds_out with 'All_Level_<METHOD>_slope'/'_intercept' per radius.
+    per radius, flattening over both 'lev' and 'time'. CDNC is broadcast up to
+    CCN's (radius, lev, time) shape first. Fits in log10-log10 space.
+
+    Returns
+    -------
+    ds_out : xr.Dataset
+        Variables 'All_Level_<METHOD>_slope' / '..._intercept' with METHOD in
+        {OLS, TLS, Deming, PCA}, dim (radius,).
     """
     CCN_aligned, CDNC_aligned = xr.align(CCN_ds, CDNC_da)
     CDNC_broadcast = CDNC_aligned.broadcast_like(CCN_aligned)
