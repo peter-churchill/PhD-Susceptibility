@@ -880,3 +880,163 @@ def test_tls_assumptions(X_log, Y_log, plot=True, var_ratio_threshold=2, ortho_s
     print(f"TLS recommendation: {tls_recommendation}")
 
     return summary, res_x, res_y
+
+
+# ============================================================================
+# Binned susceptibility builder (per station)
+# ----------------------------------------------------------------------------
+# Log-space, median-per-bin susceptibility (the correct geometric approach).
+# updraft_ds is OPTIONAL: pass None for a plain (station, radius) result, or an
+# updraft DataArray to stratify into quartile bins (station, radius, updraft_q).
+# Equal-number binning (quantile edges) is the robust default.
+# ============================================================================
+
+def build_susceptibility_dataset_by_station(
+    ccn_all_ds,
+    radii,
+    updraft_ds=None,
+    n_bins=100,
+    min_bin_points=2,
+    ccn_var="CCN",
+    cdnc_var="CDNC",
+    output_name=None,
+    Binning='Equal Number',
+):
+    """
+    Binned CCN-CDNC susceptibility per station, fit in log10-log10 space using
+    median-per-bin points (geometric averaging).
+
+    Parameters
+    ----------
+    ccn_all_ds : xr.Dataset
+        Must contain `ccn_var` (station, radius, ...) and `cdnc_var` (station, ...).
+    radii : array-like
+        CCN cutoff radii (the radius coordinate).
+    updraft_ds : xr.DataArray or None
+        If None (default), no updraft stratification: output is (station, radius).
+        If given (cloud-masked updraft, e.g. WSUB with NaN where FREQL<=0.8),
+        output is stratified into quartile bins (station, radius, updraft_q) with
+        updraft_q in ['Q0-Q75','Q75-Q90','Q90-Q100','Total'].
+    n_bins : int
+        Number of CCN bins.
+    min_bin_points : int
+        Minimum points per bin (and minimum bins) to attempt a fit.
+    ccn_var, cdnc_var : str
+        Variable names in ccn_all_ds.
+    Binning : {'Equal Number', 'Equal Space'}
+        'Equal Number' uses quantile bin edges (equal counts, robust);
+        'Equal Space' uses linear edges in log space.
+
+    Returns
+    -------
+    xr.Dataset with slope, r_value, std_err, intercept.
+    """
+    import numpy as np
+    import xarray as xr
+    from scipy import stats
+
+    stations = ccn_all_ds.station.values
+    stratify = updraft_ds is not None
+
+    def _fit_logbinned(CCN_v, CDNC_v):
+        """Median-per-bin log-log fit. Returns (slope, intercept, r, std_err) or None."""
+        if CCN_v.size < 2:
+            return None
+        lx = np.log10(CCN_v)
+        ly = np.log10(CDNC_v)
+
+        if Binning == 'Equal Space':
+            try:
+                bins = np.linspace(lx.min(), lx.max(), n_bins + 1)
+            except ValueError:
+                return None
+        elif Binning == 'Equal Number':
+            bins = np.unique(np.quantile(lx, np.linspace(0, 1, n_bins + 1)))
+            if len(bins) < 3:
+                return None
+        else:
+            raise ValueError("Binning must be 'Equal Space' or 'Equal Number'")
+
+        lx_mean, ly_mean = [], []
+        for b in range(len(bins) - 1):
+            if b == len(bins) - 2:
+                mask_bin = (lx >= bins[b]) & (lx <= bins[b + 1])
+            else:
+                mask_bin = (lx >= bins[b]) & (lx < bins[b + 1])
+            if np.sum(mask_bin) >= min_bin_points:
+                lx_mean.append(np.median(lx[mask_bin]))
+                ly_mean.append(np.median(ly[mask_bin]))
+
+        lx_mean = np.array(lx_mean)
+        ly_mean = np.array(ly_mean)
+        finite = np.isfinite(lx_mean) & np.isfinite(ly_mean)
+        if finite.sum() < min_bin_points:
+            return None
+
+        slope, intercept, r_value, _, std_err = stats.linregress(lx_mean[finite], ly_mean[finite])
+        return slope, intercept, r_value, std_err
+
+    if stratify:
+        quartile_labels = ['Q0-Q75', 'Q75-Q90', 'Q90-Q100', 'Total']
+        shape = (len(stations), len(radii), len(quartile_labels))
+        dims = ["station", "radius", "updraft_q"]
+        coords = {"station": stations, "radius": radii, "updraft_q": quartile_labels}
+    else:
+        shape = (len(stations), len(radii))
+        dims = ["station", "radius"]
+        coords = {"station": stations, "radius": radii}
+
+    ds_out = xr.Dataset(
+        data_vars={k: (dims, np.full(shape, np.nan)) for k in
+                   ["slope", "r_value", "std_err", "intercept"]},
+        coords=coords,
+    )
+
+    for s, station in enumerate(stations):
+        print(f"Processing station: {station} ({s+1}/{len(stations)})")
+
+        if stratify:
+            wsub_slice = updraft_ds.sel(station=station)
+            wsub_valid = wsub_slice.values.flatten()
+            wsub_valid = wsub_valid[np.isfinite(wsub_valid)]
+            if len(wsub_valid) < 2:
+                print(f"  Skipping {station} - not enough valid updraft points")
+                continue
+            q0, q75, q90, q100 = np.nanquantile(wsub_valid, [0, 0.75, 0.90, 1.0])
+            ranges = [(q0, q75), (q75, q90), (q90, q100), (q0, q100)]
+
+        for r_idx in range(len(radii)):
+            CCN_slice  = ccn_all_ds[ccn_var].sel(station=station).isel(radius=r_idx)
+            CDNC_slice = ccn_all_ds[cdnc_var].sel(station=station)
+
+            if stratify:
+                for q_idx, (lo, hi) in enumerate(ranges):
+                    q_mask = (wsub_slice >= lo) & (wsub_slice <= hi)
+                    CCN_q  = CCN_slice.where(q_mask).values
+                    CDNC_q = CDNC_slice.where(q_mask).values
+                    valid  = np.isfinite(CCN_q) & np.isfinite(CDNC_q)
+                    res = _fit_logbinned(CCN_q[valid], CDNC_q[valid])
+                    if res is None:
+                        continue
+                    slope, intercept, r_value, std_err = res
+                    ds_out["slope"].values[s, r_idx, q_idx]     = slope
+                    ds_out["r_value"].values[s, r_idx, q_idx]   = r_value
+                    ds_out["std_err"].values[s, r_idx, q_idx]   = std_err
+                    ds_out["intercept"].values[s, r_idx, q_idx] = intercept
+            else:
+                CCN_v  = CCN_slice.values
+                CDNC_v = CDNC_slice.values
+                valid  = np.isfinite(CCN_v) & np.isfinite(CDNC_v)
+                res = _fit_logbinned(CCN_v[valid], CDNC_v[valid])
+                if res is None:
+                    continue
+                slope, intercept, r_value, std_err = res
+                ds_out["slope"].values[s, r_idx]     = slope
+                ds_out["r_value"].values[s, r_idx]   = r_value
+                ds_out["std_err"].values[s, r_idx]   = std_err
+                ds_out["intercept"].values[s, r_idx] = intercept
+
+    if output_name is not None:
+        ds_out.attrs["name"] = output_name
+
+    return ds_out
