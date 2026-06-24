@@ -897,6 +897,7 @@ def build_susceptibility_dataset_by_station(
     updraft_ds=None,
     n_bins=100,
     min_bin_points=2,
+    min_updraft_points=100,
     ccn_var="CCN",
     cdnc_var="CDNC",
     output_name=None,
@@ -914,13 +915,17 @@ def build_susceptibility_dataset_by_station(
         CCN cutoff radii (the radius coordinate).
     updraft_ds : xr.DataArray or None
         If None (default), no updraft stratification: output is (station, radius).
-        If given (cloud-masked updraft, e.g. WSUB with NaN where FREQL<=0.8),
-        output is stratified into quartile bins (station, radius, updraft_q) with
-        updraft_q in ['Q0-Q75','Q75-Q90','Q90-Q100','Total'].
+        If given (cloud-masked W_sub), output is stratified into FIXED physical
+        updraft bins (station, radius, updraft_q) with updraft_q in
+        ['<=0.2', '0.2-0.5', '>0.5', 'Total'] (m/s). Fixed edges mean a bin is
+        comparable across stations / grid cells, so the method exports to global
+        data. A bin with < min_updraft_points valid samples returns NaN.
     n_bins : int
         Number of CCN bins.
     min_bin_points : int
-        Minimum points per bin (and minimum bins) to attempt a fit.
+        Minimum points per CCN bin to include it in the fit.
+    min_updraft_points : int
+        Minimum valid points an updraft bin needs; below this the bin -> NaN.
     ccn_var, cdnc_var : str
         Variable names in ccn_all_ds.
     Binning : {'Equal Number', 'Equal Space'}
@@ -937,6 +942,20 @@ def build_susceptibility_dataset_by_station(
 
     stations = ccn_all_ds.station.values
     stratify = updraft_ds is not None
+
+    # Fixed physical updraft bins (half-open; no double counting).
+    UPDRAFT_LABELS = ['<=0.2', '0.2-0.5', '>0.5', 'Total']
+    FLOOR = 0.2001   # catch float-exact floor from max(sqrt(WP2_CLUBB), 0.2)
+
+    def _updraft_mask(w, label):
+        if label == '<=0.2':
+            return w <= FLOOR
+        elif label == '0.2-0.5':
+            return (w > FLOOR) & (w <= 0.5)
+        elif label == '>0.5':
+            return w > 0.5
+        else:  # 'Total'
+            return np.isfinite(w)
 
     def _fit_logbinned(CCN_v, CDNC_v):
         """Median-per-bin log-log fit. Returns (slope, intercept, r, std_err) or None."""
@@ -957,30 +976,29 @@ def build_susceptibility_dataset_by_station(
         else:
             raise ValueError("Binning must be 'Equal Space' or 'Equal Number'")
 
-        lx_mean, ly_mean = [], []
+        lx_med, ly_med = [], []
         for b in range(len(bins) - 1):
             if b == len(bins) - 2:
-                mask_bin = (lx >= bins[b]) & (lx <= bins[b + 1])
+                m = (lx >= bins[b]) & (lx <= bins[b + 1])
             else:
-                mask_bin = (lx >= bins[b]) & (lx < bins[b + 1])
-            if np.sum(mask_bin) >= min_bin_points:
-                lx_mean.append(np.median(lx[mask_bin]))
-                ly_mean.append(np.median(ly[mask_bin]))
+                m = (lx >= bins[b]) & (lx < bins[b + 1])
+            if np.sum(m) >= min_bin_points:
+                lx_med.append(np.median(lx[m]))
+                ly_med.append(np.median(ly[m]))
 
-        lx_mean = np.array(lx_mean)
-        ly_mean = np.array(ly_mean)
-        finite = np.isfinite(lx_mean) & np.isfinite(ly_mean)
+        lx_med = np.array(lx_med)
+        ly_med = np.array(ly_med)
+        finite = np.isfinite(lx_med) & np.isfinite(ly_med)
         if finite.sum() < min_bin_points:
             return None
 
-        slope, intercept, r_value, _, std_err = stats.linregress(lx_mean[finite], ly_mean[finite])
+        slope, intercept, r_value, _, std_err = stats.linregress(lx_med[finite], ly_med[finite])
         return slope, intercept, r_value, std_err
 
     if stratify:
-        quartile_labels = ['Q0-Q75', 'Q75-Q90', 'Q90-Q100', 'Total']
-        shape = (len(stations), len(radii), len(quartile_labels))
+        shape = (len(stations), len(radii), len(UPDRAFT_LABELS))
         dims = ["station", "radius", "updraft_q"]
-        coords = {"station": stations, "radius": radii, "updraft_q": quartile_labels}
+        coords = {"station": stations, "radius": radii, "updraft_q": UPDRAFT_LABELS}
     else:
         shape = (len(stations), len(radii))
         dims = ["station", "radius"]
@@ -997,24 +1015,20 @@ def build_susceptibility_dataset_by_station(
 
         if stratify:
             wsub_slice = updraft_ds.sel(station=station)
-            wsub_valid = wsub_slice.values.flatten()
-            wsub_valid = wsub_valid[np.isfinite(wsub_valid)]
-            if len(wsub_valid) < 2:
-                print(f"  Skipping {station} - not enough valid updraft points")
-                continue
-            q0, q75, q90, q100 = np.nanquantile(wsub_valid, [0, 0.75, 0.90, 1.0])
-            ranges = [(q0, q75), (q75, q90), (q90, q100), (q0, q100)]
 
         for r_idx in range(len(radii)):
             CCN_slice  = ccn_all_ds[ccn_var].sel(station=station).isel(radius=r_idx)
             CDNC_slice = ccn_all_ds[cdnc_var].sel(station=station)
 
             if stratify:
-                for q_idx, (lo, hi) in enumerate(ranges):
-                    q_mask = (wsub_slice >= lo) & (wsub_slice <= hi)
+                for q_idx, label in enumerate(UPDRAFT_LABELS):
+                    q_mask = _updraft_mask(wsub_slice, label)
                     CCN_q  = CCN_slice.where(q_mask).values
                     CDNC_q = CDNC_slice.where(q_mask).values
                     valid  = np.isfinite(CCN_q) & np.isfinite(CDNC_q)
+                    # per-bin minimum sample guard -> NaN if too sparse
+                    if valid.sum() < min_updraft_points:
+                        continue
                     res = _fit_logbinned(CCN_q[valid], CDNC_q[valid])
                     if res is None:
                         continue
@@ -1040,3 +1054,5 @@ def build_susceptibility_dataset_by_station(
         ds_out.attrs["name"] = output_name
 
     return ds_out
+
+
