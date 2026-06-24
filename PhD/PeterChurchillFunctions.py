@@ -895,6 +895,7 @@ def build_susceptibility_dataset_by_station(
     ccn_all_ds,
     radii,
     updraft_ds=None,
+    bin_dim='radius',
     n_bins=100,
     min_bin_points=2,
     min_updraft_points=100,
@@ -912,7 +913,11 @@ def build_susceptibility_dataset_by_station(
     ccn_all_ds : xr.Dataset
         Must contain `ccn_var` (station, radius, ...) and `cdnc_var` (station, ...).
     radii : array-like
-        CCN cutoff radii (the radius coordinate).
+        The binning-dimension coordinate values (CCN cutoff radii, OR
+        supersaturations if bin_dim='supersaturation').
+    bin_dim : str
+        Name of the dimension to iterate/output over. 'radius' (default) for
+        cutoff-radius CCN, or 'supersaturation' for CCN-by-SS data.
     updraft_ds : xr.DataArray or None
         If None (default), no updraft stratification: output is (station, radius).
         If given (cloud-masked W_sub), output is stratified into FIXED physical
@@ -997,12 +1002,12 @@ def build_susceptibility_dataset_by_station(
 
     if stratify:
         shape = (len(stations), len(radii), len(UPDRAFT_LABELS))
-        dims = ["station", "radius", "updraft_q"]
-        coords = {"station": stations, "radius": radii, "updraft_q": UPDRAFT_LABELS}
+        dims = ["station", bin_dim, "updraft_q"]
+        coords = {"station": stations, bin_dim: radii, "updraft_q": UPDRAFT_LABELS}
     else:
         shape = (len(stations), len(radii))
-        dims = ["station", "radius"]
-        coords = {"station": stations, "radius": radii}
+        dims = ["station", bin_dim]
+        coords = {"station": stations, bin_dim: radii}
 
     ds_out = xr.Dataset(
         data_vars={k: (dims, np.full(shape, np.nan)) for k in
@@ -1017,7 +1022,7 @@ def build_susceptibility_dataset_by_station(
             wsub_slice = updraft_ds.sel(station=station)
 
         for r_idx in range(len(radii)):
-            CCN_slice  = ccn_all_ds[ccn_var].sel(station=station).isel(radius=r_idx)
+            CCN_slice  = ccn_all_ds[ccn_var].sel(station=station).isel({bin_dim: r_idx})
             CDNC_slice = ccn_all_ds[cdnc_var].sel(station=station)
 
             if stratify:
