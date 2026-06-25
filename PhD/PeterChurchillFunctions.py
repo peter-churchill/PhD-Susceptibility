@@ -1247,3 +1247,117 @@ def susceptibility_map(ccn_cb, cdnc_cb, n_bins=20, min_per_bin=4, min_bins=20):
         coords={'lat': cdnc_cb['lat'], 'lon': cdnc_cb['lon']},
         name='susceptibility',
     )
+
+
+def build_susceptibility_dataset_pooled(
+    pairs_ds,
+    radii,
+    n_bins=100,
+    min_bin_points=20,
+    bin_dim="radius",
+    updraft_var="Updraft",
+    ccn_var="CCN",
+    cdnc_var="CDNC",
+    updraft_bins=(0.0, 0.2, 0.5, float("inf")),
+    updraft_labels=("<=0.2", "0.2-0.5", ">0.5"),
+    output_name=None,
+):
+    """
+    Pooled CCN->CDNC susceptibility: regress log CDNC on log CCN over ALL samples
+    together (no per-station loop), within fixed physical updraft bands.
+
+    Use this for populations that have already been pooled across stations (e.g. the
+    high-Aitken / high-accumulation quartile sets). For a station-resolved result, use
+    build_susceptibility_dataset_by_station instead.
+
+    Parameters
+    ----------
+    pairs_ds : x.Dataset
+        Sample-stacked dataset with `ccn_var`(<bin_dim>, sample), `cdnc_var`(sample),
+        `updraft_var`(sample).
+    radii : array-like
+        Cutoff values along `bin_dim` to loop over.
+    n_bins : int
+        Number of equal-COUNT log-CCN bins (each holds ~the same number of
+        datapoints); the regression runs through the per-bin medians.
+    min_bin_points : int
+        Minimum populated bins required to attempt a fit.
+    bin_dim : str
+        Dimension of `ccn_var` to iterate (default 'radius'; 'ss' for CCN-by-supersaturation).
+    updraft_bins, updraft_labels : sequences
+        Fixed physical updraft edges/labels. A 'Total' band (all updrafts) is always appended.
+
+    Returns
+    -------
+    x.Dataset with slope/r_value/std_err/intercept on dims (<bin_dim>, updraft_q).
+    """
+    import numpy as np
+    import xarray as xr
+    from scipy import stats
+
+    wsub = pairs_ds[updraft_var]
+
+    bands = list(zip(updraft_bins[:-1], updraft_bins[1:], updraft_labels))
+    bands.append((updraft_bins[0], updraft_bins[-1], "Total"))   # all-updraft band
+    labels = [b[2] for b in bands]
+
+    ds_out = xr.Dataset(
+        data_vars={
+            "slope":     ([bin_dim, "updraft_q"], np.full((len(radii), len(labels)), np.nan)),
+            "r_value":   ([bin_dim, "updraft_q"], np.full((len(radii), len(labels)), np.nan)),
+            "std_err":   ([bin_dim, "updraft_q"], np.full((len(radii), len(labels)), np.nan)),
+            "intercept": ([bin_dim, "updraft_q"], np.full((len(radii), len(labels)), np.nan)),
+        },
+        coords={bin_dim: radii, "updraft_q": labels},
+    )
+
+    for r_idx, r_val in enumerate(radii):
+
+        CCN_slice  = pairs_ds[ccn_var].isel({bin_dim: r_idx})
+        CDNC_slice = pairs_ds[cdnc_var]
+
+        for lo, hi, q_label in bands:
+
+            # half-open band so adjacent bins don't double-count
+            mask = (wsub >= lo) & (wsub < hi)
+
+            log_CCN  = np.log10(CCN_slice.where(mask))
+            log_CDNC = np.log10(CDNC_slice.where(mask))
+
+            lx = log_CCN.values
+            ly = log_CDNC.values
+            valid = np.isfinite(lx) & np.isfinite(ly)
+            lx, ly = lx[valid], ly[valid]
+            if lx.size < 2:
+                continue
+
+            # --- Equal-COUNT bins: sort by log-CCN, split into n_bins groups of
+            #     equal datapoint count, take each group's MEDIAN. Robust to the
+            #     skewed CCN distribution (no near-empty high-CCN bins) and to
+            #     outliers within a bin. ---
+            order = np.argsort(lx)
+            lx_sorted = lx[order]
+            ly_sorted = ly[order]
+
+            lx_groups = np.array_split(lx_sorted, n_bins)
+            ly_groups = np.array_split(ly_sorted, n_bins)
+
+            lx_med = np.array([np.median(g) for g in lx_groups if g.size > 0])
+            ly_med = np.array([np.median(g) for g in ly_groups if g.size > 0])
+            finite = np.isfinite(lx_med) & np.isfinite(ly_med)
+            if finite.sum() < min_bin_points:
+                continue
+
+            slope, intercept, r_value, p_value, std_err = stats.linregress(
+                lx_med[finite], ly_med[finite]
+            )
+
+            ds_out["slope"].loc[{bin_dim: r_val, "updraft_q": q_label}]     = slope
+            ds_out["r_value"].loc[{bin_dim: r_val, "updraft_q": q_label}]   = r_value
+            ds_out["std_err"].loc[{bin_dim: r_val, "updraft_q": q_label}]   = std_err
+            ds_out["intercept"].loc[{bin_dim: r_val, "updraft_q": q_label}] = intercept
+
+    if output_name is not None:
+        ds_out.attrs["name"] = output_name
+
+    return ds_out
