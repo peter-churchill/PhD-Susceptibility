@@ -1075,3 +1075,175 @@ def build_susceptibility_dataset_by_station(
         ds_out.attrs["name"] = output_name
 
     return ds_out
+
+
+
+# ============================================================================
+# Cloud-base sampling + global aerosol-cloud diagnostics
+# (lifted from Cloud_Base.ipynb)
+# ----------------------------------------------------------------------------
+# Sample any (time, lev, lat, lon) field at the per-column cloud-base level,
+# then compute correlation / partial-correlation / binned-susceptibility maps
+# on the resulting (time, lat, lon) fields. Requires numpy (np), xarray (xr),
+# scipy.stats. Assumes lev is ASCENDING pressure (index 0 = highest altitude,
+# last index = nearest surface), as in combined.nc (691->992 hPa).
+# ============================================================================
+
+def cloud_base_index(ref, lev_dim='lev'):
+    """
+    Per-column cloud-base level index: the lowest-altitude (surface-most) level
+    with valid data, scanning from the surface upward.
+
+    Assumes lev is ascending pressure (index 0 = top, last index = surface).
+
+    Parameters
+    ----------
+    ref : xr.DataArray
+        Reference field (time, lev, lat, lon); validity is np.isfinite(ref).
+
+    Returns
+    -------
+    idx : np.ndarray (time, lat, lon)
+        Chosen lev index per column.
+    has_cloud : np.ndarray (time, lat, lon)
+        True where the column has at least one valid level.
+    """
+    valid = np.isfinite(ref.values)                  # (time, lev, lat, lon)
+    nlev = valid.shape[1]
+    # surface is the LAST lev index -> reverse so argmax finds surface-most first
+    rev_first = np.argmax(valid[:, ::-1, :, :], axis=1)
+    idx = (nlev - 1) - rev_first
+    has_cloud = valid.any(axis=1)
+    return idx, has_cloud
+
+
+def at_cloud_base(var, idx, has_cloud):
+    """
+    Sample `var` (time, lev, lat, lon) at the cloud-base level `idx`
+    (from cloud_base_index), returning (time, lat, lon) with NaN where no
+    cloud exists.
+    """
+    a = var.values
+    ti, la, lo = np.meshgrid(
+        np.arange(a.shape[0]), np.arange(a.shape[2]), np.arange(a.shape[3]),
+        indexing='ij'
+    )
+    out = a[ti, idx, la, lo].astype('float32')
+    out = np.where(has_cloud, out, np.nan)
+    return xr.DataArray(
+        out, dims=('time', 'lat', 'lon'),
+        coords={'time': var['time'], 'lat': var['lat'], 'lon': var['lon']},
+        name=f'{var.name}_cloudbase'
+    )
+
+
+def corr_map(a, b, min_n=50, log=False):
+    """
+    Per-(lat, lon) Pearson correlation over time between two (time, lat, lon)
+    fields, NaN where fewer than `min_n` joint-valid timesteps.
+
+    Parameters
+    ----------
+    log : bool
+        If True, correlate in log space (requires a, b > 0); joint validity
+        then also excludes non-positive values. Use for multiplicative
+        quantities like CCN vs CDNC.
+    """
+    if log:
+        n = np.isfinite(a) & np.isfinite(b) & (a > 0) & (b > 0)
+        am, bm = np.log(a.where(n)), np.log(b.where(n))
+    else:
+        n = np.isfinite(a) & np.isfinite(b)
+        am, bm = a.where(n), b.where(n)
+    cnt = n.sum(dim='time')
+    am = am - am.mean('time')
+    bm = bm - bm.mean('time')
+    r = (am * bm).mean('time') / (am.std('time') * bm.std('time'))
+    return r.where(cnt >= min_n)
+
+
+def partial_corr(R, i, j, k):
+    """First-order partial correlation of (i, j) controlling for k, from a
+    correlation matrix R. Returns NaN if the denominator vanishes."""
+    denom = np.sqrt((1 - R[i, k] ** 2) * (1 - R[j, k] ** 2))
+    if denom == 0:
+        return np.nan
+    return (R[i, j] - R[i, k] * R[j, k]) / denom
+
+
+def partial_corr_map(a, b, c, min_n=50):
+    """
+    Per-(lat, lon) partial correlation of (a, b) controlling for c, computed
+    in log space over time. All three are (time, lat, lon) DataArrays and must
+    be positive to enter a cell's fit.
+
+    Returns an (lat, lon) DataArray of partial r (a-b | c), NaN where a cell
+    has < min_n joint-valid positive timesteps or no variance.
+    """
+    A, B, C = a.values, b.values, c.values
+    nlat, nlon = A.shape[1], A.shape[2]
+    out = np.full((nlat, nlon), np.nan, dtype=np.float32)
+    for ia in range(nlat):
+        for ib in range(nlon):
+            av, bv, cv = A[:, ia, ib], B[:, ia, ib], C[:, ia, ib]
+            m = (np.isfinite(av) & np.isfinite(bv) & np.isfinite(cv)
+                 & (av > 0) & (bv > 0) & (cv > 0))
+            if m.sum() < min_n:
+                continue
+            la, lb, lc = np.log(av[m]), np.log(bv[m]), np.log(cv[m])
+            if la.std() == 0 or lb.std() == 0 or lc.std() == 0:
+                continue
+            R = np.corrcoef(np.vstack([la, lb, lc]))   # 0=a, 1=b, 2=c
+            out[ia, ib] = partial_corr(R, 0, 1, 2)
+    return xr.DataArray(
+        out, dims=('lat', 'lon'),
+        coords={'lat': a['lat'], 'lon': a['lon']},
+        name=f'partial_{a.name}_{b.name}_given_{c.name}',
+    )
+
+
+def binned_slope(x, y, n_bins=20, min_per_bin=4, min_bins=20):
+    """
+    Binned-median log-log slope: sort by x, split into `n_bins` equal-count
+    chunks, take the (x, y) median of each sufficiently-populated chunk, and
+    least-squares fit a line through those medians. Inputs are already in log
+    space. Returns NaN if too few points or too few usable bins.
+    """
+    if x.size < n_bins * min_per_bin:
+        return np.nan
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    mx, my = [], []
+    for chunk in np.array_split(np.arange(x.size), n_bins):
+        if chunk.size >= min_per_bin:
+            mx.append(np.median(x[chunk]))
+            my.append(np.median(y[chunk]))
+    if len(mx) < min_bins:
+        return np.nan
+    return np.polyfit(mx, my, 1)[0]
+
+
+def susceptibility_map(ccn_cb, cdnc_cb, n_bins=20, min_per_bin=4, min_bins=20):
+    """
+    Per-(lat, lon) cloud-base aerosol-cloud susceptibility: the binned-median
+    log-log slope d ln(CDNC) / d ln(CCN) over time. `ccn_cb` and `cdnc_cb` are
+    (time, lat, lon) cloud-base fields. Returns an (lat, lon) DataArray.
+    """
+    X = np.log(ccn_cb.values)      # (time, lat, lon)
+    Y = np.log(cdnc_cb.values)
+    finite = np.isfinite(X) & np.isfinite(Y)
+    nlat, nlon = X.shape[1], X.shape[2]
+    slope = np.full((nlat, nlon), np.nan, dtype=np.float32)
+    for i in range(nlat):
+        for j in range(nlon):
+            m = finite[:, i, j]
+            if m.sum() >= n_bins * min_per_bin:
+                slope[i, j] = binned_slope(
+                    X[m, i, j], Y[m, i, j],
+                    n_bins=n_bins, min_per_bin=min_per_bin, min_bins=min_bins,
+                )
+    return xr.DataArray(
+        slope, dims=('lat', 'lon'),
+        coords={'lat': cdnc_cb['lat'], 'lon': cdnc_cb['lon']},
+        name='susceptibility',
+    )
