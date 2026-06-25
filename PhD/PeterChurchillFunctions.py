@@ -637,13 +637,20 @@ def OLSGraph(x, y, summary=True, title='OLS Regression: Nd vs CCN'):
 # Estimators (OLS_fit / TLS_fit / deming_fit / PCA_fit) are defined above.
 # ============================================================================
 
-def susceptibility_by_level(CCN_ds, CDNC_da):
+def susceptibility_by_level(CCN_ds, CDNC_da, bin_dim='radius'):
     """
     Per-level susceptibility: OLS/TLS/Deming/PCA slope & intercept between
-    CCN(radius, lev, time) and CDNC(lev, time), reduced over 'time'.
+    CCN(bin_dim, lev, time) and CDNC(lev, time), reduced over 'time'.
 
     Fits are done in log10-log10 space, so each slope is the susceptibility
     (a power-law exponent d ln CDNC / d ln CCN).
+
+    Parameters
+    ----------
+    bin_dim : str
+        The non-vertical CCN dimension to keep. 'radius' (default) for
+        cutoff-radius CCN, or 'supersaturation' for CCN-by-SS data. Existing
+        callers that omit this keep the original radius behaviour.
 
     NOTE on naming: the total-least-squares fit is stored under the key 'ODR'
     here (e.g. 'ODR slope'); the all-level builder stores the same method as
@@ -653,9 +660,9 @@ def susceptibility_by_level(CCN_ds, CDNC_da):
     -------
     ds_out : xr.Dataset
         Variables '<FIT> slope' / '<FIT> intercept' with FIT in
-        {OLS, ODR, Deming, PCA}, dims (radius, lev).
+        {OLS, ODR, Deming, PCA}, dims (bin_dim, lev).
     ds_out2 : xr.Dataset
-        The aligned 'CCN' (radius, lev, time) and 'CDNC' (lev, time) used,
+        The aligned 'CCN' (bin_dim, lev, time) and 'CDNC' (lev, time) used,
         for downstream plotting.
     """
     CCN_aligned, CDNC_aligned = xr.align(CCN_ds, CDNC_da)
@@ -677,23 +684,24 @@ def susceptibility_by_level(CCN_ds, CDNC_da):
     Deming_slope, Deming_intercept = _fit(deming_fit)
     PCA_slope, PCA_intercept       = _fit(PCA_fit)
 
+    out_dims = (bin_dim, 'lev')
     ds_out = xr.Dataset(
         data_vars={
-            'OLS slope': (('radius', 'lev'), OLS_slope.data),
-            'OLS intercept': (('radius', 'lev'), OLS_intercept.data),
-            'ODR slope': (('radius', 'lev'), ODR_slope.data),
-            'ODR intercept': (('radius', 'lev'), ODR_intercept.data),
-            'Deming slope': (('radius', 'lev'), Deming_slope.data),
-            'Deming intercept': (('radius', 'lev'), Deming_intercept.data),
-            'PCA slope': (('radius', 'lev'), PCA_slope.data),
-            'PCA intercept': (('radius', 'lev'), PCA_intercept.data),
+            'OLS slope': (out_dims, OLS_slope.data),
+            'OLS intercept': (out_dims, OLS_intercept.data),
+            'ODR slope': (out_dims, ODR_slope.data),
+            'ODR intercept': (out_dims, ODR_intercept.data),
+            'Deming slope': (out_dims, Deming_slope.data),
+            'Deming intercept': (out_dims, Deming_intercept.data),
+            'PCA slope': (out_dims, PCA_slope.data),
+            'PCA intercept': (out_dims, PCA_intercept.data),
         },
-        coords={'radius': CCN_aligned.radius, 'lev': CCN_aligned.lev},
+        coords={bin_dim: CCN_aligned[bin_dim], 'lev': CCN_aligned.lev},
     )
     ds_out2 = xr.Dataset(
         data_vars={'CCN': CCN_aligned, 'CDNC': CDNC_aligned},
         coords={
-            'radius': CCN_aligned.radius,
+            bin_dim: CCN_aligned[bin_dim],
             'lev': CCN_aligned.lev,
             'time': CCN_aligned.time,
         },
@@ -701,17 +709,24 @@ def susceptibility_by_level(CCN_ds, CDNC_da):
     return ds_out, ds_out2
 
 
-def compute_allLev(CCN_ds, CDNC_da):
+def compute_allLev(CCN_ds, CDNC_da, bin_dim='radius'):
     """
     All-level pooled susceptibility: one OLS/TLS/Deming/PCA slope & intercept
-    per radius, flattening over both 'lev' and 'time'. CDNC is broadcast up to
-    CCN's (radius, lev, time) shape first. Fits in log10-log10 space.
+    per bin_dim, flattening over both 'lev' and 'time'. CDNC is broadcast up to
+    CCN's (bin_dim, lev, time) shape first. Fits in log10-log10 space.
+
+    Parameters
+    ----------
+    bin_dim : str
+        The dimension the pooled slope is reported over. 'radius' (default)
+        for cutoff-radius CCN, or 'supersaturation' for CCN-by-SS data.
+        Existing callers that omit this keep the original radius behaviour.
 
     Returns
     -------
     ds_out : xr.Dataset
         Variables 'All_Level_<METHOD>_slope' / '..._intercept' with METHOD in
-        {OLS, TLS, Deming, PCA}, dim (radius,).
+        {OLS, TLS, Deming, PCA}, dim (bin_dim,).
     """
     CCN_aligned, CDNC_aligned = xr.align(CCN_ds, CDNC_da)
     CDNC_broadcast = CDNC_aligned.broadcast_like(CCN_aligned)
@@ -733,18 +748,19 @@ def compute_allLev(CCN_ds, CDNC_da):
     slope_Deming, intercept_Deming = _fit(deming_fit)
     slope_PCA, intercept_PCA       = _fit(PCA_fit)
 
+    out_dim = (bin_dim,)
     ds_out = xr.Dataset(
         data_vars={
-            'All_Level_OLS_slope': (('radius',), slope_OLS.data),
-            'All_Level_OLS_intercept': (('radius',), intercept_OLS.data),
-            'All_Level_TLS_slope': (('radius',), slope_TLS.data),
-            'All_Level_TLS_intercept': (('radius',), intercept_TLS.data),
-            'All_Level_Deming_slope': (('radius',), slope_Deming.data),
-            'All_Level_Deming_intercept': (('radius',), intercept_Deming.data),
-            'All_Level_PCA_slope': (('radius',), slope_PCA.data),
-            'All_Level_PCA_intercept': (('radius',), intercept_PCA.data),
+            'All_Level_OLS_slope': (out_dim, slope_OLS.data),
+            'All_Level_OLS_intercept': (out_dim, intercept_OLS.data),
+            'All_Level_TLS_slope': (out_dim, slope_TLS.data),
+            'All_Level_TLS_intercept': (out_dim, intercept_TLS.data),
+            'All_Level_Deming_slope': (out_dim, slope_Deming.data),
+            'All_Level_Deming_intercept': (out_dim, intercept_Deming.data),
+            'All_Level_PCA_slope': (out_dim, slope_PCA.data),
+            'All_Level_PCA_intercept': (out_dim, intercept_PCA.data),
         },
-        coords={'radius': CCN_aligned.radius},
+        coords={bin_dim: CCN_aligned[bin_dim]},
     )
     return ds_out
 
@@ -1059,5 +1075,3 @@ def build_susceptibility_dataset_by_station(
         ds_out.attrs["name"] = output_name
 
     return ds_out
-
-
